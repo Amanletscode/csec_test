@@ -2,10 +2,14 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from pathlib import Path
+from tracemalloc import start
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
+
+import hashlib
+import json
 
 from modules.config import (
     DATA_VERSION,
@@ -30,17 +34,18 @@ from modules.data import (
     load_demo_data,
     load_workbook,
 )
+from modules.capacity import build_weekly_capacity
 from modules.discovery import discovery_search
 from modules.engine import build_near_matches, run_matching
 from modules.records import (
     ALLOCATION_COLUMNS,
     OPPORTUNITY_COLUMNS,
-    apply_confirmed_allocations,
     append_confirmed_allocations,
     load_register,
 )
 from modules.sample_data import write_demo_data
 from modules.validation import parse_skill_string, validate_request
+from modules.llm_adapter import build_azure_llm_adapter
 
 
 st.set_page_config(
@@ -53,7 +58,7 @@ st.set_page_config(
 DATA_DIR = Path(__file__).parent / "data"
 REGISTER_PATH = DATA_DIR / "staffing_register.xlsx"
 DATA_DIR.mkdir(exist_ok=True)
-if not (DATA_DIR / "resources.csv").exists() or not (DATA_DIR / "capacity.csv").exists():
+if not (DATA_DIR / "resources.csv").exists():
     write_demo_data(DATA_DIR)
 
 WORKFLOW_PAGES = ["Project brief", "Team & skills", "Recommendations"]
@@ -70,10 +75,39 @@ NAV_HELP = {
 
 
 @st.cache_data(max_entries=3)
-def load_cached_data(data_dir: str, data_version: str):
+def load_cached_resources(data_dir: str, data_version: str):
     del data_version
-    return load_demo_data(Path(data_dir))
 
+    resources_path = Path(data_dir) / "resources.csv"
+
+    resources = pd.read_csv(resources_path)
+
+    return canonicalize_resources(resources)
+
+
+def active_resources() -> pd.DataFrame:
+    if st.session_state.uploaded_data is not None:
+        uploaded_resources, _ = st.session_state.uploaded_data
+        return uploaded_resources
+
+    return load_cached_resources(
+        str(DATA_DIR),
+        DATA_VERSION,
+    )
+
+def capacity_horizon() -> tuple[pd.Timestamp, pd.Timestamp]:
+    """
+    Return the planning horizon used to build weekly capacity.
+
+    The application keeps a 30-week rolling planning horizon, matching
+    the historical capacity dataset structure.
+    """
+    today = pd.Timestamp(date.today())
+
+    start = today - pd.Timedelta(days=int(today.weekday()), unit="D")
+    end = start + pd.Timedelta(weeks=29)
+
+    return start.normalize(), end.normalize()
 
 def apply_theme() -> None:
     st.markdown(
@@ -129,7 +163,15 @@ def apply_theme() -> None:
 
 
 def navigate(page: str) -> None:
-    """Change page using plain state, never a widget key, so reruns stay safe."""
+    """
+    Change page and invalidate match results when returning to input pages.
+
+    Recommendations are only valid for the exact request that produced them.
+    """
+    if page in {"Project brief", "Team & skills"}:
+        st.session_state.results = None
+        st.session_state.result_request_fingerprint = None
+
     st.session_state.page = page
     st.rerun()
 
@@ -140,8 +182,6 @@ def request_defaults() -> dict:
         "project_name": "Healthcare analytics delivery",
         "start_date": date.today() + timedelta(days=7),
         "end_date": date.today() + timedelta(days=84),
-        "allocation_hours": 21.25,
-        "allocation_pct": 50,
         "allowed_locations": ["India"],
         "time_zones": ["Asia/Kolkata"],
         "languages": ["English"],
@@ -157,14 +197,14 @@ def request_defaults() -> dict:
         "custom_weights": False,
         "weights": DEFAULT_WEIGHTS.copy(),
         "role_mix": [{
-            "designation": "Consultant",
-            "grade": 140,
-            "headcount": 2,
-            "mandatory_skills": {"SQL": 3, "Python": 2},
-            "preferred_skills": {"Power BI": 2},
-        }],
+        "designation": "Consultant",
+        "grade": 140,
+        "headcount": 2,
+        "allocation_hours": 21.25,
+        "allocation_pct": 50.0,
         "mandatory_skills": {"SQL": 3, "Python": 2},
         "preferred_skills": {"Power BI": 2},
+    }],
     }
 
 
@@ -173,6 +213,7 @@ def init_state() -> None:
         "page": "Project brief",
         "request": request_defaults(),
         "results": None,
+        "result_request_fingerprint": None,
         "chat_history": [],
         "editor_version": 0,
         "uploaded_data": None,
@@ -182,11 +223,15 @@ def init_state() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
+def request_fingerprint(request: dict) -> str:
+    """Create a stable identifier for the exact staffing request."""
+    payload = json.dumps(
+        request,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-def active_data():
-    if st.session_state.uploaded_data is not None:
-        return st.session_state.uploaded_data
-    return load_cached_data(str(DATA_DIR), DATA_VERSION)
 
 
 def brand_bar() -> None:
@@ -357,27 +402,63 @@ def skills_from_rows(rows: pd.DataFrame) -> dict[str, int]:
 def role_rows(request: dict) -> pd.DataFrame:
     return pd.DataFrame(
         [
-            {"Designation": row["designation"], "People required": int(row["headcount"])}
+            {
+                "Designation": row["designation"],
+                "People required": int(row["headcount"]),
+                "Weekly hours/person": float(
+                    row.get("allocation_hours", 21.25)
+                ),
+            }
             for row in request.get("role_mix", [])
         ],
-        columns=["Designation", "People required"],
+        columns=[
+            "Designation",
+            "People required",
+            "Weekly hours/person",
+        ],
     )
 
 
 def roles_from_rows(rows: pd.DataFrame) -> list[dict]:
     roles = []
+
     for _, row in rows.dropna(how="all").iterrows():
         designation = str(row.get("Designation", "")).strip()
+
         if designation not in DESIGNATION_TO_GRADE:
             continue
-        headcount = pd.to_numeric(row.get("People required"), errors="coerce")
+
+        headcount = pd.to_numeric(
+            row.get("People required"),
+            errors="coerce",
+        )
+
+        allocation_hours = pd.to_numeric(
+            row.get("Weekly hours/person"),
+            errors="coerce",
+        )
+
+        if pd.isna(allocation_hours):
+            allocation_hours = 21.25
+
+        allocation_pct = (
+            float(allocation_hours)
+            / STANDARD_WEEK_HOURS
+            * 100
+        )
+
         roles.append(
             {
                 "designation": designation,
                 "grade": DESIGNATION_TO_GRADE[designation],
-                "headcount": int(headcount) if pd.notna(headcount) else 0,
+                "headcount": int(headcount)
+                if pd.notna(headcount)
+                else 0,
+                "allocation_hours": float(allocation_hours),
+                "allocation_pct": float(allocation_pct),
             }
         )
+
     return roles
 
 
@@ -409,9 +490,8 @@ def requirement_recap(request: dict) -> None:
         with left:
             st.markdown("**Delivery constraints**")
             st.write(
-                f"- Dates: {request['start_date']:%d %b %Y} to {request['end_date']:%d %b %Y}\n"
-                f"- Weekly allocation: {request.get('allocation_hours', request['allocation_pct'] / 100 * STANDARD_WEEK_HOURS):.2f} "
-                f"hours ({request['allocation_pct']:.1f}% of {STANDARD_WEEK_HOURS:g} hours)\n"
+                f"- Dates: {request['start_date']:%d %b %Y} to "
+                f"{request['end_date']:%d %b %Y}\n"
                 f"- Country: {', '.join(request.get('allowed_locations') or ['Any'])}\n"
                 f"- Time zone: {', '.join(request.get('time_zones') or ['Any'])}\n"
                 f"- Language: {', '.join(request.get('languages') or ['Any'])}\n"
@@ -427,7 +507,10 @@ def requirement_recap(request: dict) -> None:
                     "preferred_skills", request.get("preferred_skills", {})
                 )
                 st.write(
-                    f"- **{row['headcount']} × {row['designation']}** (grade {row['grade']}): "
+                    f"- **{row['headcount']} × {row['designation']}** "
+                    f"(grade {row['grade']}, "
+                    f"{row.get('allocation_hours', 21.25):.2f}h/week · "
+                    f"{row.get('allocation_pct', 50.0):.1f}% availability): "
                     + (
                         ", ".join(
                             f"{skill} · {PROFICIENCY_LABELS[level - 1]}"
@@ -465,6 +548,36 @@ def render_project_brief(resources: pd.DataFrame, capacity: pd.DataFrame) -> Non
                 placeholder="OPP-2026-011",
                 help="Used as the Opportunity Number in the register.",
             )
+            existing_opportunity_numbers = set()
+
+            try:
+                opportunities, _ = load_register(REGISTER_PATH, resources)
+
+                if not opportunities.empty:
+                    existing_opportunity_numbers = set(
+                        opportunities["Opportunity Number"]
+                        .astype(str)
+                        .str.strip()
+                        .str.casefold()
+                    )
+            except Exception:
+                existing_opportunity_numbers = set()
+
+            request_id_normalized = request_id.strip().casefold()
+
+            if (
+                request_id_normalized
+                and request_id_normalized in existing_opportunity_numbers
+            ):
+                # st.error(
+                #     f"Opportunity number `{request_id.strip()}` already exists "
+                #     "in the staffing register. Please enter a new opportunity number."
+                # )
+                opportunity_number_exists = True
+            else:
+                opportunity_number_exists = False
+
+            
             project_name = st.text_input(
                 "Project name *",
                 value=request.get("project_name", ""),
@@ -502,28 +615,7 @@ def render_project_brief(resources: pd.DataFrame, capacity: pd.DataFrame) -> Non
                     value=request.get("end_date"),
                     help="The final week for which this allocation needs capacity.",
                 )
-            allocation_hours = st.number_input(
-                "Weekly hours per person *",
-                min_value=0.25,
-                max_value=STANDARD_WEEK_HOURS,
-                value=float(
-                    request.get(
-                        "allocation_hours",
-                        request.get("allocation_pct", 50) / 100 * STANDARD_WEEK_HOURS,
-                    )
-                ),
-                step=0.25,
-                format="%.2f",
-                help=(
-                    f"PSA uses a {STANDARD_WEEK_HOURS:g}-hour week (8.5 hours × 5 days). "
-                    "A person must have at least these hours free in every requested week."
-                ),
-            )
-            allocation_pct = allocation_hours / STANDARD_WEEK_HOURS * 100
-            st.caption(
-                f"{allocation_hours / 5:.2f} hours/day · "
-                f"{allocation_pct:.1f}% of a {STANDARD_WEEK_HOURS:g}-hour week"
-            )
+            
             client_facing = st.radio(
                 "Client facing",
                 ["Y", "N"],
@@ -608,6 +700,10 @@ def render_project_brief(resources: pd.DataFrame, capacity: pd.DataFrame) -> Non
     )
 
     problems = []
+    if opportunity_number_exists:
+        problems.append(
+            "Opportunity number already exists in the staffing register. Please enter an unique opportunity number."
+        )
     if not request_id.strip():
         problems.append("Opportunity number is required.")
     if not project_name.strip():
@@ -635,8 +731,6 @@ def render_project_brief(resources: pd.DataFrame, capacity: pd.DataFrame) -> Non
             "project_name": project_name.strip(),
             "start_date": start_date,
             "end_date": end_date,
-            "allocation_hours": allocation_hours,
-            "allocation_pct": allocation_pct,
             "allowed_locations": locations,
             "allowed_teams": specific_teams,
             "time_zones": zones,
@@ -684,6 +778,18 @@ def render_team_and_skills(resources: pd.DataFrame, capacity: pd.DataFrame) -> N
                 required=True,
                 help="How many people you need at this designation.",
             ),
+            "Weekly hours/person": st.column_config.NumberColumn(
+                "Weekly hours/person",
+                min_value=0.25,
+                max_value=STANDARD_WEEK_HOURS,
+                step=0.25,
+                format="%.2f",
+                required=True,
+                help=(
+                    f"Weekly demand for each person in this role. "
+                    f"A full week is {STANDARD_WEEK_HOURS:g} hours."
+                ),
+            ),
         },
     )
     parsed_roles = roles_from_rows(edited_roles)
@@ -691,7 +797,10 @@ def render_team_and_skills(resources: pd.DataFrame, capacity: pd.DataFrame) -> N
         st.markdown(
             '<div class="preview">Requesting '
             + ", ".join(
-                f"{row['headcount']} × {row['designation']} (grade {row['grade']})"
+                f"{row['headcount']} × {row['designation']} "
+                f"(grade {row['grade']}, "
+                f"{row['allocation_hours']:.2f}h/week · "
+                f"{row['allocation_pct']:.1f}% availability)"
                 for row in parsed_roles
             )
             + "</div>",
@@ -859,6 +968,7 @@ def render_team_and_skills(resources: pd.DataFrame, capacity: pd.DataFrame) -> N
             errors = health["resources_errors"] + health["capacity_errors"] + report.errors
             if weight_total != 100:
                 errors.append("Scoring weights must total 100%.")
+            
             if errors:
                 st.error("Please fix the following before matching:")
                 for problem in errors[:8]:
@@ -869,12 +979,39 @@ def render_team_and_skills(resources: pd.DataFrame, capacity: pd.DataFrame) -> N
                         "These duplicate skills stay mandatory: "
                         + ", ".join(overlaps)
                     )
-                st.session_state.request = candidate_request
-                st.session_state.results = run_matching(
-                    resources, capacity, candidate_request, selected_weights
-                )
-                navigate("Recommendations")
+                with st.status(
+                    "Finding matching people...",
+                    expanded=True,
+                ) as status:
+                    st.write("Running the matching engine...")
+                    st.write(
+                        f"Assessing {len(resources):,} people across "
+                        f"{len(candidate_request.get('role_mix', []))} requested roles."
+                    )
 
+                    match_result = run_matching(
+                        resources,
+                        capacity,
+                        candidate_request,
+                        selected_weights,
+                    )
+
+                    st.write("Preparing recommendations...")
+
+                    status.update(
+                        label="Matching completed",
+                        state="complete",
+                        expanded=False,
+                    )
+
+                st.session_state.request = candidate_request
+                st.session_state.results = match_result
+                st.session_state.result_request_fingerprint = request_fingerprint(
+                    candidate_request
+                )
+
+                st.session_state.page = "Recommendations"
+                st.rerun()
 
 def render_recommendations(
     resources: pd.DataFrame, capacity: pd.DataFrame
@@ -885,10 +1022,22 @@ def render_recommendations(
     )
     result = st.session_state.results
     request = st.session_state.request
-    if result is None:
-        st.info("No match has been run yet. Start with the project brief and your team requirements.")
-        if st.button("Go to project brief", type="primary"):
-            navigate("Project brief")
+
+    current_fingerprint = request_fingerprint(request)
+    stored_fingerprint = st.session_state.get(
+        "result_request_fingerprint"
+    )
+
+    if (
+        result is None
+        or stored_fingerprint != current_fingerprint
+    ):
+        st.info(
+            "No current match is available for the current requirements. "
+            "Go to Team & skills and run the match again."
+        )
+        if st.button("Go to Team & skills", type="primary"):
+            navigate("Team & skills")
         return
 
     diagnostics = result.diagnostics
@@ -1577,9 +1726,32 @@ def describe_filters(intent) -> list[str]:
 def render_copilot(resources: pd.DataFrame, capacity: pd.DataFrame) -> None:
     page_header(
         "Ask Copilot",
-        "Search for people in plain language. Country means where a person works, "
-        "so asking for Germany will not return the whole of Europe.",
+        "Search for resource in plain language."
+        ,
     )
+    use_llm = st.checkbox(
+        "Use AI to interpret this request",
+        value=False,
+        help=(
+            "Uses Azure OpenAI only to understand natural-language wording. "
+            "Existing deterministic matching, eligibility rules, capacity checks, "
+            "and scoring remain unchanged."
+        ),
+    )
+
+    llm_adapter = None
+
+    if use_llm:
+        candidate_adapter = build_azure_llm_adapter()
+
+        if candidate_adapter.configured:
+            llm_adapter = candidate_adapter
+            st.caption("AI interpretation: Azure OpenAI")
+        else:
+            st.warning(
+                "Azure OpenAI is not configured. "
+                "The application will use deterministic keyword interpretation."
+            )
     examples = [
         "Consultants with SQL and Python in Germany",
         "GenAI experts in India",
@@ -1605,7 +1777,13 @@ def render_copilot(resources: pd.DataFrame, capacity: pd.DataFrame) -> None:
         if not query.strip():
             st.warning("Type a question first, or choose one of the examples above.")
         else:
-            intent, found = discovery_search(resources, capacity, query, limit=25)
+            intent, found = discovery_search(
+                resources,
+                capacity,
+                query,
+                limit=25,
+                llm_adapter=llm_adapter,
+            )
             st.session_state.chat_history.insert(
                 0, {"query": query, "intent": intent, "rows": found}
             )
@@ -1678,9 +1856,23 @@ def render_copilot(resources: pd.DataFrame, capacity: pd.DataFrame) -> None:
 
 apply_theme()
 init_state()
-resources, capacity = active_data()
-_, confirmed_allocations = load_register(REGISTER_PATH, resources)
-capacity = apply_confirmed_allocations(capacity, confirmed_allocations)
+
+resources = active_resources()
+
+_, confirmed_allocations = load_register(
+    REGISTER_PATH,
+    resources,
+)
+
+capacity_start, capacity_end = capacity_horizon()
+
+capacity = build_weekly_capacity(
+    resources=resources,
+    allocations=confirmed_allocations,
+    start_date=capacity_start,
+    end_date=capacity_end,
+)
+
 data_source_panel(resources, capacity)
 
 brand_bar()

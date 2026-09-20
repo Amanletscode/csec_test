@@ -5,7 +5,12 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from .config import DEFAULT_WEIGHTS, DESIGNATION_TO_GRADE
+from .config import (
+    DEFAULT_WEIGHTS,
+    DESIGNATION_TO_GRADE,
+    STANDARD_WEEK_HOURS,
+)
+
 from .validation import parse_skill_string, split_pipe
 
 
@@ -180,6 +185,13 @@ def run_matching(
     for role_index, role in enumerate(request.get("role_mix") or []):
         designation = role["designation"]
         requested_grade = DESIGNATION_TO_GRADE[designation]
+
+        role_allocation_pct = float(
+            role.get(
+                "allocation_pct",
+                request.get("allocation_pct", 50),
+            )
+        )
         role_key = _role_key(role_index, role)
         # A mixed team can need different capabilities at each level. Legacy
         # request-level skills remain a safe fallback for uploaded integrations.
@@ -199,9 +211,12 @@ def run_matching(
                 resource_id,
                 request["start_date"],
                 request["end_date"],
-                request["allocation_pct"],
+                role_allocation_pct,
             )
-            stats = _capacity_stats(window, request["allocation_pct"])
+            stats = _capacity_stats(
+                window,
+                role_allocation_pct,
+            )
             resource_grade = pd.to_numeric(resource.get("grade"), errors="coerce")
             gates = {
                 "Location": not request.get("allowed_locations")
@@ -252,7 +267,10 @@ def run_matching(
                 "mandatory_skills": _coverage_score(skills, mandatory, 100.0),
                 "preferred_skills": _coverage_score(skills, preferred, 50.0),
                 "proficiency": _proficiency_score(skills, mandatory, preferred),
-                "capacity": _capacity_score(stats, request["allocation_pct"]),
+                "capacity": _capacity_score(
+                    stats,
+                    role_allocation_pct,
+                ),
             }
             components = {
                 name: score * normalized_weights[name]
@@ -264,6 +282,13 @@ def run_matching(
                 {
                     "role_key": role_key,
                     "requested_designation": designation,
+                    "requested_allocation_hours": float(
+                        role.get(
+                            "allocation_hours",
+                            role_allocation_pct / 100 * STANDARD_WEEK_HOURS,
+                        )
+                    ),
+                    "requested_allocation_pct": role_allocation_pct,
                     "requested_grade": requested_grade,
                     "requested_headcount": int(role["headcount"]),
                     "requested_mandatory_skills": mandatory,

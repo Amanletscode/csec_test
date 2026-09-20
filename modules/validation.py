@@ -14,6 +14,7 @@ from .config import (
     PROFICIENCY,
     SKILL_ALIASES,
     SKILL_CATALOG,
+    STANDARD_WEEK_HOURS,
     TIME_ZONES,
 )
 
@@ -171,7 +172,7 @@ def validate_capacity(df: pd.DataFrame, resources: pd.DataFrame) -> ValidationRe
 def validate_request(request: dict) -> ValidationReport:
     errors: list[str] = []
     warnings: list[str] = []
-    required = ["start_date", "end_date", "allocation_pct", "role_mix"]
+    required = ["start_date", "end_date", "role_mix"]
     if any(k not in request for k in required):
         return ValidationReport(False, ["The staffing request is incomplete."], warnings)
     try:
@@ -183,12 +184,7 @@ def validate_request(request: dict) -> ValidationReport:
             errors.append("Request duration cannot exceed two years.")
     except Exception:
         errors.append("Start and end dates must be valid dates.")
-    try:
-        allocation = float(request["allocation_pct"])
-        if not 1 <= allocation <= 100:
-            errors.append("Allocation must be between 1% and 100%.")
-    except Exception:
-        errors.append("Allocation must be numeric.")
+
     role_mix = request.get("role_mix") or []
     if not isinstance(role_mix, list) or not role_mix:
         errors.append("Add at least one role and headcount.")
@@ -200,6 +196,50 @@ def validate_request(request: dict) -> ValidationReport:
                 headcount = int(row.get("headcount", 0))
             except (TypeError, ValueError):
                 headcount = 0
+
+            allocation_hours = pd.to_numeric(
+                row.get("allocation_hours"),
+                errors="coerce",
+            )
+
+            allocation_pct = pd.to_numeric(
+                row.get("allocation_pct"),
+                errors="coerce",
+            )
+
+            if pd.isna(allocation_hours):
+                errors.append(
+                    f"{designation}: weekly allocation hours are required."
+                )
+            elif not 0.25 <= float(allocation_hours) <= STANDARD_WEEK_HOURS:
+                errors.append(
+                    f"{designation}: weekly allocation must be between "
+                    f"0.25 and {STANDARD_WEEK_HOURS:g} hours."
+                )
+
+            if pd.isna(allocation_pct):
+                errors.append(
+                    f"{designation}: allocation percentage is required."
+                )
+            elif not 1 <= float(allocation_pct) <= 100:
+                errors.append(
+                    f"{designation}: allocation percentage must be between 1% and 100%."
+                )
+
+            if (
+                pd.notna(allocation_hours)
+                and pd.notna(allocation_pct)
+            ):
+                expected_pct = (
+                    float(allocation_hours)
+                    / STANDARD_WEEK_HOURS
+                    * 100
+                )
+
+                if abs(float(allocation_pct) - expected_pct) > 0.1:
+                    errors.append(
+                        f"{designation}: allocation hours and percentage are inconsistent."
+                    )
             if designation not in DESIGNATIONS:
                 errors.append(f"Unsupported designation: {designation}")
             elif int(row.get("grade", DESIGNATION_TO_GRADE[designation])) != DESIGNATION_TO_GRADE[designation]:

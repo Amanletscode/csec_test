@@ -252,14 +252,17 @@ def append_confirmed_allocations(
                 "Employee ID": str(person.resource_id),
                 "Employee Name": str(person.resource_name),
                 "Opportunity Number": opportunity_number,
-                "Project Name": request.get("project_name", "Untitled project"),
-                "Allocation Hours / Week": float(
-                    request.get(
-                        "allocation_hours",
-                        float(request["allocation_pct"]) / 100 * STANDARD_WEEK_HOURS,
-                    )
+                "Project Name": request.get(
+                    "project_name",
+                    "Untitled project",
                 ),
-                "Allocation %": round(float(request["allocation_pct"]), 1),
+                "Allocation Hours / Week": float(
+                    person["requested_allocation_hours"]
+                ),
+                "Allocation %": round(
+                    float(person["requested_allocation_pct"]),
+                    1,
+                ),
                 "Allocation Start Date": str(request["start_date"]),
                 "Allocation End Date": str(request["end_date"]),
                 "Status": "Confirmed",
