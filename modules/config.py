@@ -91,8 +91,7 @@ KPI_FOCUS_AREAS = [
 ]
 
 TRAVEL_REQUIREMENTS = [
-    "No travel", "Kickoff onsite", "Monthly onsite", "Quarterly onsite",
-    "Up to 10%", "Up to 15%", "Up to 20%",
+    "No", "Yes",
 ]
 
 SKILL_CATALOG = [

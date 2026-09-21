@@ -61,12 +61,12 @@ DATA_DIR.mkdir(exist_ok=True)
 if not (DATA_DIR / "resources.csv").exists():
     write_demo_data(DATA_DIR)
 
-WORKFLOW_PAGES = ["Project brief", "Team & skills", "Recommendations"]
+WORKFLOW_PAGES = ["Project Details", "Team & skills", "Recommendations"]
 TOOL_PAGES = ["Capacity & risk", "Ask Copilot"]
 PAGES = WORKFLOW_PAGES + TOOL_PAGES
 NAV_LABELS = {page: page for page in PAGES}
 NAV_HELP = {
-    "Project brief": "Delivery window, eligibility rules and opportunity record.",
+    "Project Details": "Delivery window, eligibility rules and opportunity record.",
     "Team & skills": "Headcount per designation, required skills and ranking weights.",
     "Recommendations": "People who meet every requirement, ranked by fit.",
     "Capacity & risk": "Unused capacity, coverage risk and the weekly capacity trend.",
@@ -168,7 +168,7 @@ def navigate(page: str) -> None:
 
     Recommendations are only valid for the exact request that produced them.
     """
-    if page in {"Project brief", "Team & skills"}:
+    if page in {"Project Details", "Team & skills"}:
         st.session_state.results = None
         st.session_state.result_request_fingerprint = None
 
@@ -210,7 +210,7 @@ def request_defaults() -> dict:
 
 def init_state() -> None:
     initial = {
-        "page": "Project brief",
+        "page": "Project Details",
         "request": request_defaults(),
         "results": None,
         "result_request_fingerprint": None,
@@ -218,10 +218,22 @@ def init_state() -> None:
         "editor_version": 0,
         "uploaded_data": None,
         "last_register_result": None,
+
+        # ----------------------------------------------------------
+        # Optional LLM state
+        # ----------------------------------------------------------
+        "llm_enabled": False,
+        "llm_adapter": None,
+        "llm_draft": None,
+        "llm_draft_source": "",
+        "llm_summary": None,
+        "copilot_query": "",
     }
+
     for key, value in initial.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
 
 def request_fingerprint(request: dict) -> str:
     """Create a stable identifier for the exact staffing request."""
@@ -231,6 +243,579 @@ def request_fingerprint(request: dict) -> str:
         default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+def get_llm_adapter():
+    """
+    Return the configured Azure LLM adapter only when AI is enabled.
+
+    No Azure call happens merely because the application is running.
+    """
+    if not st.session_state.get("llm_enabled", False):
+        return None
+
+    adapter = st.session_state.get("llm_adapter")
+
+    if adapter is None:
+        adapter = build_azure_llm_adapter()
+        st.session_state.llm_adapter = adapter
+
+    if not adapter.configured:
+        return None
+
+    return adapter
+
+
+def governed_llm_values(resources: pd.DataFrame) -> dict:
+    """
+    Build the controlled vocabulary supplied to the LLM.
+
+    The LLM is not allowed to invent values outside these lists.
+    """
+
+    team_options = []
+
+    if resources is not None and "team" in resources.columns:
+        team_options = sorted(
+            {
+                str(value).strip()
+                for value in resources["team"].dropna().tolist()
+                if str(value).strip()
+            }
+        )
+
+    return {
+        "designations": list(DESIGNATIONS),
+        "designation_to_grade": {
+            str(key): int(value)
+            for key, value in DESIGNATION_TO_GRADE.items()
+        },
+        "skills": list(SKILL_CATALOG),
+        "locations": list(LOCATIONS),
+        "time_zones": list(TIME_ZONES),
+        "languages": list(LANGUAGES),
+        "teams": team_options,
+        "therapeutic_areas": list(THERAPEUTIC_AREAS),
+        "kpi_focus_areas": list(KPI_FOCUS_AREAS),
+        "travel_requirements": list(TRAVEL_REQUIREMENTS),
+        "proficiency_levels": list(PROFICIENCY_LABELS),
+        "standard_week_hours": STANDARD_WEEK_HOURS,
+    }
+
+
+def _normalise_llm_list(value) -> list:
+    """
+    Defensive conversion of an LLM list field.
+    """
+    if value is None:
+        return []
+
+    if isinstance(value, list):
+        return [
+            str(item).strip()
+            for item in value
+            if str(item).strip()
+        ]
+
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _normalise_llm_date(value):
+    """
+    Convert a valid YYYY-MM-DD style value to a Python date.
+
+    Invalid values become None instead of breaking the application.
+    """
+    if value in (None, "", "null"):
+        return None
+
+    try:
+        return pd.Timestamp(value).date()
+    except Exception:
+        return None
+
+
+def _governed_skill_level(value):
+    """
+    Convert a proficiency label or numeric level into the application's
+    integer proficiency representation.
+
+    Returns None when the value is not governed.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (int, float)):
+        numeric = int(value)
+        if 1 <= numeric <= len(PROFICIENCY_LABELS):
+            return numeric
+        return None
+
+    text = str(value).strip()
+
+    if text in PROFICIENCY_LABELS:
+        return PROFICIENCY_LABELS.index(text) + 1
+
+    # Compatibility with possible numeric strings.
+    try:
+        numeric = int(float(text))
+        if 1 <= numeric <= len(PROFICIENCY_LABELS):
+            return numeric
+    except Exception:
+        pass
+
+    return None
+
+
+def _governed_skills(items) -> dict:
+    """
+    Convert LLM skill objects into the application's
+    {skill: proficiency_level} structure.
+
+    Unknown skills/proficiencies are silently excluded from
+    the AI draft rather than entering the deterministic engine.
+    """
+
+    if not isinstance(items, list):
+        return {}
+
+    result = {}
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+
+        skill = str(item.get("skill") or "").strip()
+
+        if skill not in SKILL_CATALOG:
+            continue
+
+        level = _governed_skill_level(
+            item.get("proficiency")
+        )
+
+        if level is None:
+            # No proficiency means the LLM did not provide a
+            # sufficiently governed requirement.
+            continue
+
+        result[skill] = level
+
+    return result
+
+
+def normalise_llm_draft(
+    draft: dict,
+    resources: pd.DataFrame,
+) -> dict:
+    """
+    Validate and normalise an LLM staffing draft before it is
+    allowed to influence the normal application workflow.
+
+    This is a safety boundary between Azure output and the
+    deterministic application.
+    """
+
+    if not isinstance(draft, dict):
+        raise ValueError("The AI draft is not a valid object.")
+
+    team_options = set()
+
+    if resources is not None and "team" in resources.columns:
+        team_options = {
+            str(value).strip()
+            for value in resources["team"].dropna().tolist()
+            if str(value).strip()
+        }
+
+    allowed_locations = [
+        value
+        for value in _normalise_llm_list(
+            draft.get("allowed_locations")
+        )
+        if value in LOCATIONS
+    ]
+
+    time_zones = [
+        value
+        for value in _normalise_llm_list(
+            draft.get("time_zones")
+        )
+        if value in TIME_ZONES
+    ]
+
+    languages = [
+        value
+        for value in _normalise_llm_list(
+            draft.get("languages")
+        )
+        if value in LANGUAGES
+    ]
+
+    allowed_teams = [
+        value
+        for value in _normalise_llm_list(
+            draft.get("allowed_teams")
+        )
+        if value in team_options
+    ]
+
+    therapeutic_area = draft.get("therapeutic_area")
+
+    if therapeutic_area not in THERAPEUTIC_AREAS:
+        therapeutic_area = None
+
+    kpi_focus_areas = [
+        value
+        for value in _normalise_llm_list(
+            draft.get("kpi_focus_areas")
+        )
+        if value in KPI_FOCUS_AREAS
+    ]
+
+    travel_requirement = draft.get("travel_requirement")
+
+    if travel_requirement not in TRAVEL_REQUIREMENTS:
+        travel_requirement = None
+
+    client_facing = draft.get("client_facing")
+
+    if client_facing is not None:
+        client_facing = str(client_facing).strip().upper()
+
+        if client_facing not in {"Y", "N"}:
+            client_facing = None
+
+    roles = []
+
+    raw_roles = draft.get("roles")
+
+    if isinstance(raw_roles, list):
+        for raw_role in raw_roles:
+            if not isinstance(raw_role, dict):
+                continue
+
+            designation = str(
+                raw_role.get("designation") or ""
+            ).strip()
+
+            if designation not in DESIGNATIONS:
+                continue
+
+            # Never trust an LLM-provided grade.
+            # The application owns designation -> grade.
+            grade = DESIGNATION_TO_GRADE[designation]
+
+            headcount = raw_role.get("headcount")
+
+            try:
+                headcount = int(headcount)
+            except Exception:
+                headcount = None
+
+            if headcount is None or not 1 <= headcount <= 50:
+                continue
+
+            allocation_hours = raw_role.get(
+                "allocation_hours"
+            )
+
+            try:
+                allocation_hours = float(allocation_hours)
+            except Exception:
+                allocation_hours = None
+
+            if (
+                allocation_hours is None
+                or allocation_hours <= 0
+                or allocation_hours > STANDARD_WEEK_HOURS
+            ):
+                continue
+
+            allocation_pct = (
+                allocation_hours
+                / STANDARD_WEEK_HOURS
+                * 100
+            )
+
+            mandatory = _governed_skills(
+                raw_role.get("mandatory_skills", [])
+            )
+
+            preferred = _governed_skills(
+                raw_role.get("preferred_skills", [])
+            )
+
+            # A skill cannot be simultaneously mandatory and preferred.
+            preferred = {
+                skill: level
+                for skill, level in preferred.items()
+                if skill not in mandatory
+            }
+
+            roles.append(
+                {
+                    "designation": designation,
+                    "grade": grade,
+                    "headcount": headcount,
+                    "allocation_hours": allocation_hours,
+                    "allocation_pct": allocation_pct,
+                    "mandatory_skills": mandatory,
+                    "preferred_skills": preferred,
+                }
+            )
+
+    start_date = _normalise_llm_date(
+        draft.get("start_date")
+    )
+
+    end_date = _normalise_llm_date(
+        draft.get("end_date")
+    )
+
+    result = {
+        "project_name": (
+            str(draft.get("project_name") or "").strip()
+            or None
+        ),
+        "client": (
+            str(draft.get("client") or "").strip()
+            or None
+        ),
+        "project_description": (
+            str(draft.get("project_description") or "").strip()
+            or None
+        ),
+        "start_date": start_date,
+        "end_date": end_date,
+        "allowed_locations": allowed_locations,
+        "time_zones": time_zones,
+        "languages": languages,
+        "allowed_teams": allowed_teams,
+        "therapeutic_area": therapeutic_area,
+        "kpi_focus_areas": kpi_focus_areas,
+        "client_facing": client_facing,
+        "client_location": (
+            str(draft.get("client_location") or "").strip()
+            or None
+        ),
+        "travel_requirement": travel_requirement,
+        "role_mix": roles,
+    }
+
+    return result
+
+
+def apply_llm_draft_to_request(
+    draft: dict,
+) -> None:
+    """
+    Apply the reviewed AI draft to the normal application request.
+
+    Existing opportunity number and scoring settings are preserved.
+    """
+
+    request = st.session_state.request
+
+    updated = request.copy()
+
+    # Never let the LLM invent/replace the opportunity number.
+    # The existing Project Details field remains authoritative.
+    for field in [
+        "project_name",
+        "client",
+        "project_description",
+        "start_date",
+        "end_date",
+        "allowed_locations",
+        "time_zones",
+        "languages",
+        "allowed_teams",
+        "therapeutic_area",
+        "kpi_focus_areas",
+        "client_location",
+        "travel_requirement",
+    ]:
+        value = draft.get(field)
+
+        if value is None:
+            continue
+
+        if isinstance(value, list) and not value:
+            continue
+
+        if value == "":
+            continue
+
+        updated[field] = value
+
+    if draft.get("client_facing") in {"Y", "N"}:
+        updated["client_facing"] = draft["client_facing"]
+
+    if draft.get("kpi_focus_areas"):
+        updated["kpi_focus_area"] = " | ".join(
+            draft["kpi_focus_areas"]
+        )
+
+    if draft.get("role_mix"):
+        updated["role_mix"] = draft["role_mix"]
+
+    # The deterministic engine uses role-specific skills.
+    updated["mandatory_skills"] = {}
+    updated["preferred_skills"] = {}
+
+    st.session_state.request = updated
+
+    # Force the data editors to rebuild from the new AI draft.
+    st.session_state.editor_version += 1
+
+    # Any previous recommendations are now stale.
+    st.session_state.results = None
+    st.session_state.result_request_fingerprint = None
+    st.session_state.llm_summary = None
+
+
+def llm_draft_display(draft: dict) -> None:
+    """
+    Human-readable preview of the AI-generated staffing draft.
+    """
+
+    st.markdown("### AI-generated draft")
+
+    st.caption(
+        "Review this carefully before applying it. "
+        "The AI is only preparing the request. "
+        "The existing application remains responsible for matching."
+    )
+
+    left, right = st.columns(2, gap="large")
+
+    with left:
+        st.markdown("**Project**")
+
+        st.write(
+            f"**Project:** "
+            f"{draft.get('project_name') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Client:** "
+            f"{draft.get('client') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Start:** "
+            f"{draft.get('start_date') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**End:** "
+            f"{draft.get('end_date') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Work countries:** "
+            f"{', '.join(draft.get('allowed_locations') or []) or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Time zones:** "
+            f"{', '.join(draft.get('time_zones') or []) or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Languages:** "
+            f"{', '.join(draft.get('languages') or []) or 'Not specified'}"
+        )
+
+    with right:
+        st.markdown("**Business context**")
+
+        st.write(
+            f"**Therapeutic area:** "
+            f"{draft.get('therapeutic_area') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**KPI focus:** "
+            f"{', '.join(draft.get('kpi_focus_areas') or []) or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Team:** "
+            f"{', '.join(draft.get('allowed_teams') or []) or 'All teams'}"
+        )
+
+        st.write(
+            f"**Travel:** "
+            f"{draft.get('travel_requirement') or 'Not specified'}"
+        )
+
+        st.write(
+            f"**Client location:** "
+            f"{draft.get('client_location') or 'Not specified'}"
+        )
+
+    description = draft.get("project_description")
+
+    if description:
+        st.markdown("**Project description**")
+        st.info(description)
+
+    st.markdown("### Requested team")
+
+    roles = draft.get("role_mix") or []
+
+    if not roles:
+        st.warning(
+            "The AI did not identify a complete role requirement. "
+            "You can add the role manually in Team & skills."
+        )
+        return
+
+    for role in roles:
+        mandatory = role.get("mandatory_skills", {})
+        preferred = role.get("preferred_skills", {})
+
+        mandatory_text = (
+            ", ".join(
+                f"{skill} ({PROFICIENCY_LABELS[level - 1]})"
+                for skill, level in mandatory.items()
+            )
+            or "None"
+        )
+
+        preferred_text = (
+            ", ".join(
+                f"{skill} ({PROFICIENCY_LABELS[level - 1]})"
+                for skill, level in preferred.items()
+            )
+            or "None"
+        )
+
+        with st.container(border=True):
+            st.markdown(
+                f"**{role['headcount']} × "
+                f"{role['designation']}**"
+            )
+
+            st.write(
+                f"Weekly hours/person: "
+                f"{role['allocation_hours']:.2f}"
+            )
+
+            st.write(
+                f"Mandatory: {mandatory_text}"
+            )
+
+            st.write(
+                f"Nice to have: {preferred_text}"
+            )
+
 
 
 
@@ -528,12 +1113,12 @@ def requirement_recap(request: dict) -> None:
                         else ""
                     )
                 )
-        st.caption("Change these in the project brief or team & skills, then run the match again.")
+        st.caption("Change these in the Project Details or team & skills, then run the match again.")
 
 
 def render_project_brief(resources: pd.DataFrame, capacity: pd.DataFrame) -> None:
     page_header(
-        "Project brief",
+        "Project Details",
         "Delivery window, eligibility rules and the opportunity record written to the register.",
     )
     request = st.session_state.request
@@ -926,8 +1511,8 @@ def render_team_and_skills(resources: pd.DataFrame, capacity: pd.DataFrame) -> N
     st.divider()
     back_column, run_column = st.columns([1, 2])
     with back_column:
-        if st.button("Back to project brief", width="stretch"):
-            navigate("Project brief")
+        if st.button("Back to Project Details", width="stretch"):
+            navigate("Project Details")
     with run_column:
         if st.button(
             "Find matching people",
@@ -1132,6 +1717,110 @@ def render_recommendations(
             "requested_designation": st.column_config.TextColumn("Requested role")
         },
     )
+
+     # ---------------------------------------------------------------
+    # Optional AI explanation of deterministic recommendations
+    # ---------------------------------------------------------------
+
+    if st.session_state.get("llm_enabled", False):
+        st.divider()
+
+        st.markdown(
+            "### AI recommendation summary"
+        )
+
+        st.caption(
+            "This explanation is generated from the deterministic "
+            "recommendations above. AI does not re-rank or change them."
+        )
+
+        adapter = get_llm_adapter()
+
+        if adapter is None:
+            st.info(
+                "AI summary is unavailable because the approved "
+                "Azure OpenAI configuration is not active."
+            )
+        else:
+            if st.button(
+                "Generate AI summary",
+                key="generate_ai_recommendation_summary",
+            ):
+                summary_rows = []
+
+                for _, row in eligible.head(5).iterrows():
+                    summary_rows.append(
+                        {
+                            "rank": int(row["rank"])
+                            if pd.notna(row.get("rank"))
+                            else None,
+                            "requested_designation": row.get(
+                                "requested_designation"
+                            ),
+                            "resource_name": row.get(
+                                "resource_name"
+                            ),
+                            "grade": row.get("grade"),
+                            "team": row.get("team"),
+                            "location": row.get("location"),
+                            "time_zone": row.get("time_zone"),
+                            "total_score": row.get(
+                                "total_score"
+                            ),
+                            "minimum_available_hours": row.get(
+                                "minimum_available_hours"
+                            ),
+                        }
+                    )
+
+                request_summary = {
+                    "project_name": request.get(
+                        "project_name"
+                    ),
+                    "client": request.get(
+                        "client"
+                    ),
+                    "start_date": request.get(
+                        "start_date"
+                    ),
+                    "end_date": request.get(
+                        "end_date"
+                    ),
+                    "allowed_locations": request.get(
+                        "allowed_locations"
+                    ),
+                    "time_zones": request.get(
+                        "time_zones"
+                    ),
+                    "languages": request.get(
+                        "languages"
+                    ),
+                    "role_mix": request.get(
+                        "role_mix"
+                    ),
+                }
+
+                with st.spinner(
+                    "Preparing AI explanation..."
+                ):
+                    try:
+                        st.session_state.llm_summary = (
+                            adapter.summarize_recommendations(
+                                request_summary,
+                                summary_rows,
+                            )
+                        )
+                    except Exception as exc:
+                        st.error(
+                            "The AI summary could not be generated."
+                        )
+                        st.exception(exc)
+
+            if st.session_state.get("llm_summary"):
+                st.info(
+                    st.session_state.llm_summary
+                )
+
 
     st.divider()
     eligible = eligible.copy()
@@ -1723,135 +2412,410 @@ def describe_filters(intent) -> list[str]:
     return chips
 
 
-def render_copilot(resources: pd.DataFrame, capacity: pd.DataFrame) -> None:
+
+def render_copilot(
+    resources: pd.DataFrame,
+    capacity: pd.DataFrame,
+) -> None:
     page_header(
         "Ask Copilot",
-        "Search for resource in plain language."
-        ,
+        "Use AI to turn a natural-language staffing request into a "
+        "reviewable Project Details and Team & skills draft.",
     )
+
+    # ---------------------------------------------------------------
+    # AI master switch
+    # ---------------------------------------------------------------
+
     use_llm = st.checkbox(
-        "Use AI to interpret this request",
-        value=False,
+        "Use AI capabilities",
+        value=st.session_state.get("llm_enabled", False),
         help=(
-            "Uses Azure OpenAI only to understand natural-language wording. "
-            "Existing deterministic matching, eligibility rules, capacity checks, "
-            "and scoring remain unchanged."
+            "When enabled, Azure OpenAI may interpret natural-language "
+            "requests and prepare an editable staffing draft. "
+            "When disabled, the existing deterministic application "
+            "continues to work normally."
         ),
     )
 
-    llm_adapter = None
+    st.session_state.llm_enabled = use_llm
 
-    if use_llm:
-        candidate_adapter = build_azure_llm_adapter()
+    if not use_llm:
+        st.info(
+            "AI is currently OFF. The existing deterministic Copilot "
+            "search remains available below."
+        )
 
-        if candidate_adapter.configured:
-            llm_adapter = candidate_adapter
-            st.caption("AI interpretation: Azure OpenAI")
-        else:
-            st.warning(
-                "Azure OpenAI is not configured. "
-                "The application will use deterministic keyword interpretation."
-            )
+        # -----------------------------------------------------------
+        # Existing deterministic search
+        # -----------------------------------------------------------
+
+        examples = [
+            "Consultants with SQL and Python in Germany",
+            "GenAI experts in India",
+            "Power BI people in India with 21-25 hours free from 2026-09-21",
+        ]
+
+        example_columns = st.columns(len(examples))
+
+        for index, example in enumerate(examples):
+            if example_columns[index].button(
+                example,
+                key=f"deterministic_example_{index}",
+                width="stretch",
+                help="Use this example question.",
+            ):
+                st.session_state.copilot_query = example
+
+        query = st.text_input(
+            "What are you looking for?",
+            value=st.session_state.get(
+                "copilot_query",
+                "",
+            ),
+            placeholder=(
+                "For example: Tableau consultants in India "
+                "with 21 hours free from 2026-09-21"
+            ),
+            help=(
+                "Mention skills, country, designation, weekly free "
+                "hours and a start date."
+            ),
+        )
+
+        if st.button(
+            "Search",
+            type="primary",
+            key="deterministic_search",
+        ):
+            if not query.strip():
+                st.warning(
+                    "Type a question first, or choose one of the examples above."
+                )
+            else:
+                intent, found = discovery_search(
+                    resources,
+                    capacity,
+                    query,
+                    limit=25,
+                    llm_adapter=None,
+                )
+
+                st.session_state.chat_history.insert(
+                    0,
+                    {
+                        "query": query,
+                        "intent": intent,
+                        "rows": found,
+                    },
+                )
+
+        for item in st.session_state.chat_history[:3]:
+            with st.container(border=True):
+                st.markdown(
+                    f"**You asked:** {item['query']}"
+                )
+
+                chips = describe_filters(
+                    item["intent"]
+                )
+
+                if chips:
+                    st.caption(
+                        "Understood as — "
+                        + " | ".join(chips)
+                    )
+
+                found = item["rows"]
+
+                if found.empty:
+                    st.info(
+                        "Nobody matched every part of that question. "
+                        "Try removing one condition, or check the spelling "
+                        "of the skill or country."
+                    )
+                    continue
+
+                found = found.copy()
+
+                if "minimum_available_pct" in found:
+                    found["minimum_available_hours"] = (
+                        found["minimum_available_pct"]
+                        / 100
+                        * STANDARD_WEEK_HOURS
+                    )
+
+                st.caption(
+                    f"{len(found)} people found."
+                )
+
+                st.dataframe(
+                    found[
+                        [
+                            column
+                            for column in [
+                                "rank",
+                                "resource_name",
+                                "role_title",
+                                "grade",
+                                "team",
+                                "location",
+                                "minimum_available_hours",
+                                "key_skills",
+                                "contact_email",
+                                "manager_name",
+                            ]
+                            if column in found.columns
+                        ]
+                    ],
+                    hide_index=True,
+                    width="stretch",
+                    column_config={
+                        "rank": "#",
+                        "resource_name": "Person",
+                        "role_title": "Designation",
+                        "grade": "Grade",
+                        "team": "Team",
+                        "location": "Country",
+                        "minimum_available_hours":
+                            st.column_config.NumberColumn(
+                                "Free weekly hours",
+                                format="%.2f h",
+                            ),
+                        "key_skills": "Relevant skills",
+                        "contact_email": "Email",
+                        "manager_name": "Manager",
+                    },
+                )
+
+        return
+
+    # ---------------------------------------------------------------
+    # AI mode
+    # ---------------------------------------------------------------
+
+    adapter = get_llm_adapter()
+
+    if adapter is None:
+        st.warning(
+            "AI is enabled, but Azure OpenAI is not currently configured. "
+            "The existing application remains usable, but AI drafting "
+            "cannot run until the approved Azure configuration is available."
+        )
+
+        st.caption(
+            "No API key is used. This integration expects the approved "
+            "Microsoft Entra authentication configuration."
+        )
+
+        return
+
+    st.success(
+        "AI is enabled. Enter the project request in normal language."
+    )
+
+    st.caption(
+        "The AI will prepare a draft only. You will review it in "
+        "Project Details and Team & skills before matching."
+    )
+
     examples = [
-        "Consultants with SQL and Python in Germany",
-        "GenAI experts in India",
-        "Power BI people in India with 21-25 hours free from 2026-09-21",
+        (
+            "Example 1",
+            "We need two Consultants in India for a healthcare "
+            "analytics project starting 5 October 2026 for 12 weeks. "
+            "They should have SQL and Python as mandatory skills, "
+            "Power BI would be nice to have, and each person should "
+            "be available for 30 hours per week."
+        ),
+        (
+            "Example 2",
+            "For a Germany project starting 12 October 2026, "
+            "we need one Senior Consultant for 20 hours per week. "
+            "They must know Databricks and Python and preferably "
+            "have Machine Learning experience."
+        ),
     ]
-    example_columns = st.columns(len(examples))
-    for index, example in enumerate(examples):
-        if example_columns[index].button(
-            example, key=f"example_{index}", width="stretch", help="Use this example question."
+
+    for label, example in examples:
+        if st.button(
+            label,
+            key=f"ai_example_{label.replace(' ', '_')}",
+            width="stretch",
         ):
             st.session_state.copilot_query = example
 
-    query = st.text_input(
-        "What are you looking for?",
-        value=st.session_state.get("copilot_query", ""),
-        placeholder="For example: Tableau consultants in India with 21 hours free from 2026-09-21",
+    query = st.text_area(
+        "Describe the staffing request",
+        value=st.session_state.get(
+            "copilot_query",
+            "",
+        ),
+        height=180,
+        placeholder=(
+            "Example: We need two Consultants in India for a "
+            "12-week healthcare analytics project..."
+        ),
         help=(
-            "Mention skills, country, designation, weekly free hours and a start date. "
-            "Percentage availability is also accepted for compatibility."
+            "Describe the project, dates, locations, roles, headcount, "
+            "weekly hours and skills in normal language."
         ),
     )
-    if st.button("Search", type="primary"):
+
+    interpret_clicked = st.button(
+        "Interpret request with AI",
+        type="primary",
+        width="stretch",
+        key="interpret_staffing_request",
+    )
+
+    if interpret_clicked:
         if not query.strip():
-            st.warning("Type a question first, or choose one of the examples above.")
+            st.warning(
+                "Describe the staffing request first."
+            )
         else:
-            intent, found = discovery_search(
-                resources,
-                capacity,
-                query,
-                limit=25,
-                llm_adapter=llm_adapter,
-            )
-            st.session_state.chat_history.insert(
-                0, {"query": query, "intent": intent, "rows": found}
-            )
-
-    for item in st.session_state.chat_history[:3]:
-        with st.container(border=True):
-            st.markdown(f"**You asked:** {item['query']}")
-            chips = describe_filters(item["intent"])
-            if chips:
-                st.caption("Understood as — " + " | ".join(chips))
-            found = item["rows"]
-            if found.empty:
-                st.info(
-                    "Nobody matched every part of that question. Try removing one condition, "
-                    "or check the spelling of the skill or country."
+            with st.status(
+                "AI is interpreting the request...",
+                expanded=True,
+            ) as status:
+                st.write(
+                    "Reading the project requirements..."
                 )
-                continue
-            found = found.copy()
-            if "minimum_available_pct" in found:
-                found["minimum_available_hours"] = (
-                    found["minimum_available_pct"] / 100 * STANDARD_WEEK_HOURS
-                )
-            st.caption(f"{len(found)} people found.")
-            st.dataframe(
-                found[
-                    [
-                        column
-                        for column in [
-                            "rank",
-                            "resource_name",
-                            "role_title",
-                            "grade",
-                            "team",
-                            "location",
-                            "minimum_available_hours",
-                            "key_skills",
-                            "contact_email",
-                            "manager_name",
-                        ]
-                        if column in found.columns
-                    ]
-                ],
-                hide_index=True,
-                width="stretch",
-                column_config={
-                    "rank": "#",
-                    "resource_name": "Person",
-                    "role_title": "Designation",
-                    "grade": "Grade",
-                    "team": "Team",
-                    "location": "Country",
-                    "minimum_available_hours": st.column_config.NumberColumn(
-                        "Free weekly hours", format="%.2f h"
-                    ),
-                    "key_skills": "Relevant skills",
-                    "contact_email": "Email",
-                    "manager_name": "Manager",
-                },
-            )
 
-    with st.expander("How this will work with an approved LLM", expanded=False):
-        st.write(
-            "Search currently runs on keywords, so no API key is needed. When an approved model "
-            "is available it plugs into the same contract at runtime: it only turns your sentence "
-            "into the governed filters shown above. Its output is checked against the catalogue, "
-            "it cannot change any eligibility rule or score, and if it fails or times out the "
-            "keyword search takes over automatically."
+                governed_values = governed_llm_values(
+                    resources
+                )
+
+                try:
+                    raw_draft = adapter.draft_staffing_request(
+                        query,
+                        governed_values,
+                    )
+
+                    draft = normalise_llm_draft(
+                        raw_draft,
+                        resources,
+                    )
+
+                    st.session_state.llm_draft = draft
+                    st.session_state.llm_draft_source = query
+                    st.session_state.llm_summary = None
+
+                    status.update(
+                        label="AI interpretation completed",
+                        state="complete",
+                        expanded=False,
+                    )
+
+                except Exception as exc:
+                    st.error("AI interpretation could not be completed.")
+
+                    error_text = str(exc)
+
+                    if "No module named 'configs'" in error_text:
+                        st.warning(
+                            "The approved IQVIA Azure OpenAI configuration is not "
+                            "available in this Python environment. No application "
+                            "data or deterministic staffing logic was changed."
+                        )
+                    elif "azure-identity" in error_text:
+                        st.warning(
+                            "The Azure authentication package is not available "
+                            "in this Python environment."
+                        )
+                    elif "openai" in error_text.lower():
+                        st.warning(
+                            "The Azure OpenAI client package is not available "
+                            "in this Python environment."
+                        )
+                    else:
+                        st.warning(
+                            "The AI service could not interpret this request. "
+                            "No application data or deterministic staffing logic "
+                            "was changed."
+                        )
+
+                    with st.expander("Technical details"):
+                        st.code(error_text)
+
+    # ---------------------------------------------------------------
+    # Draft review
+    # ---------------------------------------------------------------
+
+    draft = st.session_state.get(
+        "llm_draft"
+    )
+
+    if draft:
+        st.divider()
+
+        llm_draft_display(draft)
+
+        st.divider()
+
+        st.warning(
+            "Review the AI interpretation before applying it. "
+            "If anything is wrong, you can correct it after applying "
+            "the draft in the normal Project Details and Team & skills tabs."
         )
+
+        apply_column, discard_column = st.columns(
+            [2, 1]
+        )
+
+        with apply_column:
+            if st.button(
+                "Apply draft to Project Details & Team",
+                type="primary",
+                width="stretch",
+                key="apply_llm_draft",
+            ):
+                apply_llm_draft_to_request(
+                    draft
+                )
+
+                st.session_state.llm_draft = None
+
+                st.session_state.page = (
+                    "Project Details"
+                )
+
+                st.rerun()
+
+        with discard_column:
+            if st.button(
+                "Discard draft",
+                width="stretch",
+                key="discard_llm_draft",
+            ):
+                st.session_state.llm_draft = None
+                st.session_state.llm_draft_source = ""
+                st.rerun()
+
+    # ---------------------------------------------------------------
+    # AI architecture explanation
+    # ---------------------------------------------------------------
+
+    with st.expander(
+        "How AI works in this application",
+        expanded=False,
+    ):
+        st.markdown(
+            """
+**AI understands the request. The application decides the staffing.**
+
+1. Azure OpenAI interprets the manager's natural-language request.
+2. The response is restricted to the application's governed values.
+3. The manager reviews the generated draft.
+4. The draft is applied to the normal Project Details and Team & skills.
+5. The manager can change anything before matching.
+6. The existing deterministic engine performs eligibility,
+   capacity checks and scoring.
+7. Recommendations remain controlled by the existing application.
+            """
+        )
+
 
 
 apply_theme()
@@ -1879,7 +2843,7 @@ brand_bar()
 main_navigation()
 
 page = st.session_state.page
-if page == "Project brief":
+if page == "Project Details":
     render_project_brief(resources, capacity)
 elif page == "Team & skills":
     render_team_and_skills(resources, capacity)
