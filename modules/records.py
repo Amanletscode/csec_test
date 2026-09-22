@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .config import STANDARD_WEEK_HOURS
+from .config import STANDARD_WEEK_HOURS, country_from_client_location
 
 
 OPPORTUNITY_COLUMNS = [
@@ -19,6 +19,7 @@ OPPORTUNITY_COLUMNS = [
     "KPI Focus Area",
     "Client Facing?",
     "Client Location",
+    "Client Country",
     "Time Zone",
     "Language Requirement",
     "Travel Requirement",
@@ -39,16 +40,16 @@ ALLOCATION_COLUMNS = [
 
 def _dummy_opportunities() -> pd.DataFrame:
     rows = [
-        ["OPP-2026-001", "Patient Support Program Analytics", "Axerion Pharma", "Build adherence and abandonment monitoring with patient-level analytics.", "2026-10-01", "2027-03-31", 4, "Oncology", "Adherence | Abandonment | Refill Rate", "Y", "USA - New York", "EST", "English", "Quarterly onsite"],
-        ["OPP-2026-002", "Copay Card Optimization", "Northstar Biopharma", "Assess copay enrolment, utilisation and affordability barriers.", "2026-10-15", "2027-02-15", 3, "Immunology", "Copay Utilisation | Enrolment Rate | Conversion", "Y", "USA - Chicago", "CST", "English", "No travel"],
-        ["OPP-2026-003", "Oncology Market Share Tracker", "Helix Therapeutics", "Automate market-share and competitor-performance tracking.", "2026-11-01", "2027-06-30", 2, "Oncology", "Market Share | NBRx | TRx", "Y", "Germany - Frankfurt", "CET", "English | German", "Up to 10%"],
-        ["OPP-2026-004", "Omnichannel HCP Engagement", "Auriga Life Sciences", "Measure channel mix, attribution and HCP response.", "2026-10-20", "2027-04-30", 4, "Cardiology", "HCP Reach | Engagement Rate | Channel Conversion", "Y", "UK - London", "GMT", "English", "Kickoff onsite"],
-        ["OPP-2026-005", "Diabetes Forecasting Engine", "Maple BioHealth", "Create brand forecasts with scenario planning.", "2026-11-15", "2027-06-15", 3, "Diabetes", "Forecast Accuracy | Market Growth", "N", "Canada - Toronto", "EST", "English | French", "No travel"],
-        ["OPP-2026-006", "Global Patient Services Dashboard", "Orion Health Partners", "Build global operational dashboards for patient services.", "2026-10-01", "2027-09-30", 5, "Rare Disease", "Service Level | Adherence | Case Resolution", "Y", "Singapore", "SGT", "English", "Up to 15%"],
-        ["OPP-2026-007", "Rare Disease Patient Journey", "Vela Therapeutics", "Map diagnosis-to-treatment journeys and drop-off points.", "2026-12-01", "2027-03-31", 2, "Rare Disease", "Time to Diagnosis | Persistence | Drop-off Rate", "Y", "France - Paris", "CET", "English | French", "Monthly onsite"],
-        ["OPP-2026-008", "Contact Center Performance", "Solstice Pharma", "Analyse abandonment, handling time and resolution.", "2026-10-01", "2027-01-31", 2, "Patient Services", "Call Abandonment | AHT | First Call Resolution", "N", "USA - San Francisco", "PST", "English", "No travel"],
-        ["OPP-2026-009", "Obesity Brand Growth Analytics", "Iberia Metabolic Health", "Support GLP-1 launch and territory analytics.", "2026-11-01", "2027-01-31", 3, "Obesity", "Market Share | HCP Reach | Patient Starts", "Y", "Spain - Madrid", "CET", "English | Spanish", "Up to 20%"],
-        ["OPP-2026-010", "Next Best Action Engine", "Sakura BioPharma", "Build explainable HCP engagement recommendations.", "2027-01-01", "2027-07-31", 5, "Neurology", "KPI Engagement | Conversion | Incremental Sales", "Y", "Japan - Tokyo", "JST", "English | Japanese", "Quarterly onsite"],
+        ["OPP-2026-001", "Patient Support Program Analytics", "Axerion Pharma", "Build adherence and abandonment monitoring with patient-level analytics.", "2026-10-01", "2027-03-31", 4, "Oncology", "Adherence | Abandonment | Refill Rate", "Y", "USA - New York", "USA", "America/New_York", "English", "Yes"],
+        ["OPP-2026-002", "Copay Card Optimization", "Northstar Biopharma", "Assess copay enrolment, utilisation and affordability barriers.", "2026-10-15", "2027-02-15", 3, "Immunology", "Copay Utilisation | Enrolment Rate | Conversion", "Y", "USA - Chicago", "USA", "America/Chicago", "English", "No"],
+        ["OPP-2026-003", "Oncology Market Share Tracker", "Helix Therapeutics", "Automate market-share and competitor-performance tracking.", "2026-11-01", "2027-06-30", 2, "Oncology", "Market Share | NBRx | TRx", "Y", "Germany - Frankfurt", "Germany", "Europe/Berlin", "English | German", "Yes"],
+        ["OPP-2026-004", "Omnichannel HCP Engagement", "Auriga Life Sciences", "Measure channel mix, attribution and HCP response.", "2026-10-20", "2027-04-30", 4, "Cardiology", "HCP Reach | Engagement Rate | Channel Conversion", "Y", "UK - London", "UK", "Europe/London", "English", "Yes"],
+        ["OPP-2026-005", "Diabetes Forecasting Engine", "Maple BioHealth", "Create brand forecasts with scenario planning.", "2026-11-15", "2027-06-15", 3, "Diabetes", "Forecast Accuracy | Market Growth", "N", "Canada - Toronto", "Canada", "America/Toronto", "English | French", "No"],
+        ["OPP-2026-006", "Global Patient Services Dashboard", "Orion Health Partners", "Build global operational dashboards for patient services.", "2026-10-01", "2027-09-30", 5, "Rare Disease", "Service Level | Adherence | Case Resolution", "Y", "Singapore", "Singapore", "Asia/Singapore", "English", "Yes"],
+        ["OPP-2026-007", "Rare Disease Patient Journey", "Vela Therapeutics", "Map diagnosis-to-treatment journeys and drop-off points.", "2026-12-01", "2027-03-31", 2, "Rare Disease", "Time to Diagnosis | Persistence | Drop-off Rate", "Y", "France - Paris", "France", "Europe/Paris", "English | French", "Yes"],
+        ["OPP-2026-008", "Contact Center Performance", "Solstice Pharma", "Analyse abandonment, handling time and resolution.", "2026-10-01", "2027-01-31", 2, "Patient Services", "Call Abandonment | AHT | First Call Resolution", "N", "USA - San Francisco", "USA", "America/Los_Angeles", "English", "No"],
+        ["OPP-2026-009", "Obesity Brand Growth Analytics", "Iberia Metabolic Health", "Support GLP-1 launch and territory analytics.", "2026-11-01", "2027-01-31", 3, "Obesity", "Market Share | HCP Reach | Patient Starts", "Y", "Spain - Madrid", "Spain", "Europe/Berlin", "English | Spanish", "Yes"],
+        ["OPP-2026-010", "Next Best Action Engine", "Sakura BioPharma", "Build explainable HCP engagement recommendations.", "2027-01-01", "2027-07-31", 5, "Neurology", "KPI Engagement | Conversion | Incremental Sales", "Y", "Japan - Tokyo", "Japan", "Asia/Tokyo", "English | Japanese", "Yes"],
     ]
     return pd.DataFrame(rows, columns=OPPORTUNITY_COLUMNS)
 
@@ -138,6 +139,12 @@ def load_register(path: Path, resources: pd.DataFrame) -> tuple[pd.DataFrame, pd
     opportunities = book.get(
         "Opportunities", pd.DataFrame(columns=OPPORTUNITY_COLUMNS)
     ).reindex(columns=OPPORTUNITY_COLUMNS)
+    if "Client Country" in opportunities.columns:
+        derived_countries = opportunities["Client Location"].map(
+            country_from_client_location
+        )
+        blank_country = opportunities["Client Country"].fillna("").astype(str).str.strip().eq("")
+        opportunities.loc[blank_country, "Client Country"] = derived_countries.loc[blank_country]
     allocations = book.get("Allocations", pd.DataFrame(columns=ALLOCATION_COLUMNS))
     if "Allocation Hours / Week" not in allocations:
         allocation_pct = pd.to_numeric(
@@ -221,13 +228,17 @@ def append_confirmed_allocations(
             "Client Facing?": request.get("client_facing", "N"),
             "Client Location": request.get(
                 "client_location",
-                " | ".join(request.get("allowed_locations") or ["Not specified"]),
+                "Not specified",
             ),
+            "Client Country": request.get(
+                "client_country",
+                country_from_client_location(request.get("client_location")),
+            ) or "Not specified",
             "Time Zone": " | ".join(request.get("time_zones") or ["Not specified"]),
             "Language Requirement": " | ".join(
                 request.get("languages") or ["Not specified"]
             ),
-            "Travel Requirement": request.get("travel_requirement", "No travel"),
+            "Travel Requirement": request.get("travel_requirement", "No"),
         }
         opportunities = pd.concat(
             [opportunities, pd.DataFrame([opportunity])], ignore_index=True

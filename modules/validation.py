@@ -9,8 +9,10 @@ from .config import (
     DESIGNATION_TO_GRADE,
     GRADE_CODES,
     LANGUAGES,
-    LOCATION_TO_TIMEZONE,
+    CLIENT_LOCATION_TO_COUNTRY,
+    GEOGRAPHIES,
     LOCATIONS,
+    TRAVEL_REQUIREMENTS,
     PROFICIENCY,
     SKILL_ALIASES,
     SKILL_CATALOG,
@@ -29,9 +31,7 @@ REQUIRED_RESOURCE_COLUMNS = {
     "languages", "skills", "domains", "development_interests", "years_experience",
     "delivery_rating", "profile_updated",
 }
-REQUIRED_CAPACITY_COLUMNS = {
-    "resource_id", "week_start", "available_capacity_pct",
-}
+
 
 ALIAS_LOWER = {k.lower(): v for k, v in SKILL_ALIASES.items()}
 
@@ -140,34 +140,6 @@ def validate_resources(df: pd.DataFrame) -> ValidationReport:
     return ValidationReport(not errors, errors, warnings)
 
 
-def validate_capacity(df: pd.DataFrame, resources: pd.DataFrame) -> ValidationReport:
-    errors: list[str] = []
-    warnings: list[str] = []
-    missing = REQUIRED_CAPACITY_COLUMNS - set(df.columns)
-    if missing:
-        errors.append(f"Capacity file is missing required columns: {', '.join(sorted(missing))}")
-        return ValidationReport(False, errors, warnings)
-    if df.empty:
-        errors.append("Capacity dataset is empty.")
-        return ValidationReport(False, errors, warnings)
-    cap = df.copy()
-    cap["week_start"] = pd.to_datetime(cap["week_start"], errors="coerce").dt.normalize()
-    if cap.week_start.isna().any():
-        errors.append("Capacity contains invalid week_start values.")
-    vals = pd.to_numeric(cap["available_capacity_pct"], errors="coerce")
-    if vals.isna().any():
-        errors.append("Capacity column 'available_capacity_pct' contains non-numeric values.")
-    if ((vals < 0) | (vals > 100)).any():
-        errors.append("Capacity column 'available_capacity_pct' must stay between 0 and 100.")
-    unknown_ids = set(cap.resource_id.astype(str)) - set(resources.resource_id.astype(str))
-    if unknown_ids:
-        errors.append(f"Capacity references unknown resource IDs: {', '.join(sorted(unknown_ids)[:8])}")
-    if cap.duplicated(["resource_id", "week_start"], keep=False).any():
-        errors.append("Duplicate resource/week capacity rows found.")
-    if cap.week_start.notna().any() and cap.loc[cap.week_start.notna(), "week_start"].dt.weekday.ne(0).any():
-        warnings.append("Some capacity dates are not Mondays; request windows use Monday-based weeks.")
-    return ValidationReport(not errors, errors, warnings)
-
 
 def validate_request(request: dict) -> ValidationReport:
     errors: list[str] = []
@@ -265,14 +237,35 @@ def validate_request(request: dict) -> ValidationReport:
                 warnings.append(
                     f"{designation}: mandatory takes precedence for {', '.join(sorted(role_overlap))}."
                 )
+    # Work country is a resource attribute used for travel matching, not a normal
+    # staffing-request filter. Time zone and geographic expertise are separate gates.
     for field, allowed, label in [
-        ("allowed_locations", LOCATIONS, "location"),
         ("languages", LANGUAGES, "language"),
         ("time_zones", TIME_ZONES, "time zone"),
+        ("geographies", GEOGRAPHIES, "geographic expertise"),
+        ("travel_requirement", TRAVEL_REQUIREMENTS, "travel requirement"),
     ]:
-        for val in request.get(field, []) or []:
+        values = request.get(field, []) or []
+        if field == "travel_requirement":
+            values = [values] if not isinstance(values, (list, tuple, set)) else values
+        for val in values:
             if val not in allowed:
                 errors.append(f"Unsupported {label}: {val}")
+
+    client_location = str(request.get("client_location") or "").strip()
+    client_country = str(request.get("client_country") or "").strip()
+    if client_location:
+        expected_country = CLIENT_LOCATION_TO_COUNTRY.get(client_location)
+        if expected_country and client_country and client_country != expected_country:
+            errors.append(
+                f"Client country does not match client location: {client_location}"
+            )
+        if expected_country and not client_country:
+            client_country = expected_country
+
+    travel_requirement = str(request.get("travel_requirement") or "No").strip()
+    if travel_requirement == "Yes" and not client_country:
+        errors.append("Client country is required when travel requirement is Yes.")
     for team in request.get("allowed_teams", []) or []:
         if not str(team).strip():
             errors.append("Specific team cannot be blank.")
@@ -295,11 +288,6 @@ def validate_request(request: dict) -> ValidationReport:
     )
     if not has_role_skills and not request.get("mandatory_skills") and not request.get("preferred_skills"):
         warnings.append("No skills were selected; recommendations will be driven by capacity and domain.")
-    # If a timezone is explicitly selected, validate the location-to-timezone relationship only as information.
-    # The actual gate remains exact on the candidate's timezone so mixed-location global searches remain possible.
-    selected_locations = request.get("allowed_locations") or []
-    selected_zones = request.get("time_zones") or []
-    implied_zones = {LOCATION_TO_TIMEZONE.get(x) for x in selected_locations if x in LOCATION_TO_TIMEZONE}
-    if selected_zones and implied_zones and not implied_zones.intersection(selected_zones):
-        warnings.append("Selected locations and selected time zones do not overlap. This may intentionally produce zero matches.")
+    # Work country is intentionally not validated as a staffing filter.
+    # Geographic expertise and time zone are independent request dimensions.
     return ValidationReport(not errors, errors, warnings)

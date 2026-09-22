@@ -43,17 +43,24 @@ LANGUAGES = [
     "Portuguese", "Italian", "Arabic", "Korean", "Dutch", "Russian",
 ]
 
+# Resource work country remains a country-level master-data attribute.
+# It is intentionally NOT used as the normal staffing-request location filter.
 LOCATIONS = [
     "India", "UK", "France", "Germany", "Spain", "USA", "Canada",
     "Singapore", "Japan", "Australia", "Philippines",
 ]
 
+# Exact IANA time zones governed by the current staffing-sheet taxonomy.
+# Resource records are validated against this governed set.
 TIME_ZONES = [
-    "Asia/Kolkata", "Europe/London", "Europe/Paris", "Europe/Berlin",
-    "America/New_York", "America/Chicago", "America/Los_Angeles",
-    "America/Toronto", "Asia/Singapore", "Asia/Manila", "Asia/Tokyo", "Australia/Sydney",
+    "America/Chicago", "America/Los_Angeles", "America/New_York",
+    "America/Toronto", "Asia/Kolkata", "Asia/Manila", "Asia/Singapore",
+    "Asia/Tokyo", "Australia/Sydney", "Europe/Berlin", "Europe/London",
+    "Europe/Paris",
 ]
 
+# Legacy country-level mapping retained for compatibility with older callers.
+# New staffing logic must use exact resource.time_zone values instead.
 LOCATION_TO_TIMEZONE = {
     "India": "Asia/Kolkata",
     "UK": "Europe/London",
@@ -67,6 +74,83 @@ LOCATION_TO_TIMEZONE = {
     "Australia": "Australia/Sydney",
     "Philippines": "Asia/Manila",
 }
+
+# Client locations are governed at city level because client working hours
+# and travel requirements are tied to the actual client location.
+CLIENT_LOCATIONS = [
+    "Australia - Sydney",
+    "Canada - Toronto",
+    "France - Paris",
+    "Germany - Berlin",
+    "Germany - Frankfurt",
+    "India",
+    "India - Hyderabad",
+    "Japan - Tokyo",
+    "Philippines - Manila",
+    "Singapore",
+    "Spain - Madrid",
+    "UK - London",
+    "USA - Chicago",
+    "USA - Los Angeles",
+    "USA - New York",
+    "USA - San Francisco",
+]
+
+CLIENT_LOCATION_TO_COUNTRY = {
+    "Australia - Sydney": "Australia",
+    "Canada - Toronto": "Canada",
+    "France - Paris": "France",
+    "Germany - Berlin": "Germany",
+    "Germany - Frankfurt": "Germany",
+    "India": "India",
+    "India - Hyderabad": "India",
+    "Japan - Tokyo": "Japan",
+    "Philippines - Manila": "Philippines",
+    "Singapore": "Singapore",
+    "Spain - Madrid": "Spain",
+    "UK - London": "UK",
+    "USA - Chicago": "USA",
+    "USA - Los Angeles": "USA",
+    "USA - New York": "USA",
+    "USA - San Francisco": "USA",
+}
+
+# Canonical IANA timezone for each governed client city/location.
+# This is deliberately separate from resource work-country data.
+CLIENT_LOCATION_TO_TIMEZONE = {
+    "Australia - Sydney": "Australia/Sydney",
+    "Canada - Toronto": "America/Toronto",
+    "France - Paris": "Europe/Paris",
+    "Germany - Berlin": "Europe/Berlin",
+    "Germany - Frankfurt": "Europe/Berlin",
+    "India": "Asia/Kolkata",
+    "India - Hyderabad": "Asia/Kolkata",
+    "Japan - Tokyo": "Asia/Tokyo",
+    "Philippines - Manila": "Asia/Manila",
+    "Singapore": "Asia/Singapore",
+    "Spain - Madrid": "Europe/Berlin",
+    "UK - London": "Europe/London",
+    "USA - Chicago": "America/Chicago",
+    "USA - Los Angeles": "America/Los_Angeles",
+    "USA - New York": "America/New_York",
+    "USA - San Francisco": "America/Los_Angeles",
+}
+
+# Geography expertise is a capability, not physical work location. These
+# values are taken from the current resources.csv geography_expertise field.
+GEOGRAPHIES = [
+    "ANZ", "APAC", "Australia", "Canada", "DACH", "East Asia",
+    "Europe", "France", "Germany", "India", "Italy", "Japan",
+    "North America", "Philippines", "Singapore", "South Asia",
+    "Southeast Asia", "Southern Europe", "Spain", "UK", "USA",
+    "United States", "Western Europe",
+]
+
+
+def country_from_client_location(client_location: str) -> str | None:
+    """Return the governed client country without fuzzy inference."""
+    value = str(client_location or "").strip()
+    return CLIENT_LOCATION_TO_COUNTRY.get(value)
 
 DOMAINS = [
     "Healthcare", "Life Sciences", "Commercial Analytics", "Patient Services",

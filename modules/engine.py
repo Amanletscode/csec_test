@@ -170,10 +170,11 @@ def run_matching(
     exclusion_counts = {
         key: 0
         for key in [
-            "location",
             "team",
             "time_zone",
             "language",
+            "geographic_expertise",
+            "travel",
             "grade",
             "mandatory_skill",
             "mandatory_proficiency",
@@ -218,9 +219,29 @@ def run_matching(
                 role_allocation_pct,
             )
             resource_grade = pd.to_numeric(resource.get("grade"), errors="coerce")
+
+            resource_geographies = split_pipe(resource.get("geography_expertise"))
+            requested_geographies = set(request.get("geographies") or [])
+            geography_pass = (
+                not requested_geographies
+                or bool(requested_geographies.intersection(resource_geographies))
+            )
+
+            travel_required = (
+                str(request.get("travel_requirement") or "No").strip().casefold() == "yes"
+            )
+            client_country = str(request.get("client_country") or "").strip()
+            resource_country = str(resource.get("location") or "").strip()
+            travel_pass = (
+                not travel_required
+                or (
+                    bool(client_country)
+                    and bool(resource_country)
+                    and resource_country.casefold() == client_country.casefold()
+                )
+            )
+
             gates = {
-                "Location": not request.get("allowed_locations")
-                or str(resource.get("location")) in request["allowed_locations"],
                 "Specific team": not request.get("allowed_teams")
                 or str(resource.get("team")) in request["allowed_teams"],
                 "Time zone": not request.get("time_zones")
@@ -228,6 +249,8 @@ def run_matching(
                 "Language": set(request.get("languages") or []).issubset(
                     split_pipe(resource.get("languages"))
                 ),
+                "Geographic expertise": geography_pass,
+                "Travel": travel_pass,
                 "Grade / designation": pd.notna(resource_grade)
                 and int(resource_grade) == requested_grade
                 and str(resource.get("role_title")) == designation,
@@ -237,10 +260,11 @@ def run_matching(
                 "Weekly available capacity": stats["weeks_below_demand"] == 0,
             }
             reason_map = {
-                "Location": "Work location does not match",
                 "Specific team": "Team does not match",
                 "Time zone": "Time zone does not match",
                 "Language": "Required language is missing",
+                "Geographic expertise": "Geographic expertise does not match",
+                "Travel": "Work country does not match the client country required for travel",
                 "Grade / designation": "Grade or designation does not match",
                 "Mandatory skill presence": "Mandatory skill is missing",
                 "Mandatory proficiency": "Mandatory proficiency is below requirement",
@@ -249,10 +273,11 @@ def run_matching(
             }
             reasons = [reason_map[name] for name, passed in gates.items() if not passed]
             count_keys = {
-                "location": "Location",
                 "team": "Specific team",
                 "time_zone": "Time zone",
                 "language": "Language",
+                "geographic_expertise": "Geographic expertise",
+                "travel": "Travel",
                 "grade": "Grade / designation",
                 "mandatory_skill": "Mandatory skill presence",
                 "mandatory_proficiency": "Mandatory proficiency",
@@ -299,6 +324,7 @@ def run_matching(
                     "grade": int(resource_grade) if pd.notna(resource_grade) else 0,
                     "role_title": str(resource.get("role_title", "")),
                     "location": str(resource.get("location", "")),
+                    "work_city": str(resource.get("work_city", "")),
                     "time_zone": str(resource.get("time_zone", "")),
                     "languages": str(resource.get("languages", "")),
                     "status": "Eligible" if eligible else "Excluded",

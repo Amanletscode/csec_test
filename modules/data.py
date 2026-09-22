@@ -4,7 +4,7 @@ from pathlib import Path
 import pandas as pd
 
 from .config import DESIGNATION_TO_GRADE, GRADE_LABELS
-from .validation import validate_capacity, validate_resources
+from .validation import validate_resources
 
 
 def read_table(file_or_path, **kwargs) -> pd.DataFrame:
@@ -26,9 +26,7 @@ def _sheet(book: dict, *names):
 
 def load_workbook(file_obj):
     book = pd.read_excel(file_obj, sheet_name=None)
-    resources = _sheet(book, "Resources", "Resource", "Employees", "Employee")
-    capacity = _sheet(book, "Capacity", "Weekly Capacity", "WeeklyCapacity")
-    return resources, capacity
+    return _sheet(book, "Resources", "Resource", "Employees", "Employee")
 
 
 def canonicalize_resources(df: pd.DataFrame) -> pd.DataFrame:
@@ -36,6 +34,7 @@ def canonicalize_resources(df: pd.DataFrame) -> pd.DataFrame:
     aliases = {
         "employee_id": "resource_id", "emp_id": "resource_id", "name": "resource_name",
         "employee_name": "resource_name", "timezone": "time_zone", "time zone": "time_zone",
+        "workcity": "work_city", "work city": "work_city", "city": "work_city",
         "designation": "role_title", "grade_code": "grade",
         "skills_proficiency": "skills", "skill_proficiency": "skills",
         "therapeutic_areas": "domains", "therapeutic_area": "domains",
@@ -48,7 +47,9 @@ def canonicalize_resources(df: pd.DataFrame) -> pd.DataFrame:
     defaults = {
         "resource_id": "", "resource_name": "", "team": "Unassigned", "grade": 130,
         "role_title": "",
-        "location": "Unknown", "time_zone": "Unknown", "languages": "English",
+        # Work country remains the resource-level location used by travel logic.
+        # Work city is kept separately so it is never confused with geography expertise.
+        "location": "Unknown", "work_city": "", "time_zone": "Unknown", "languages": "English",
         "skills": "", "domains": "", "development_interests": "", "years_experience": 0,
         "delivery_rating": 0, "profile_updated": pd.Timestamp.today().date(),
         "manager_name": "Not provided", "manager_email": "", "contact_email": "",
@@ -69,44 +70,18 @@ def canonicalize_resources(df: pd.DataFrame) -> pd.DataFrame:
     role = out["role_title"].fillna("").astype(str).str.strip()
     out["role_title"] = role.where(role.ne(""), role_from_grade)
     out["profile_updated"] = pd.to_datetime(out["profile_updated"], errors="coerce")
+    out["location"] = out["location"].fillna("").astype(str).str.strip()
+    out["work_city"] = out["work_city"].fillna("").astype(str).str.strip()
     out["time_zone"] = out["time_zone"].fillna("").astype(str).str.strip()
     return out
 
 
-def canonicalize_capacity(df: pd.DataFrame | None) -> pd.DataFrame:
-    if df is None:
-        return pd.DataFrame(columns=["resource_id", "week_start", "available_capacity_pct"])
-    out = df.copy()
-    aliases = {"available_pct": "available_capacity_pct", "availability_pct": "available_capacity_pct"}
-    for old, new in aliases.items():
-        if old in out.columns and new not in out.columns:
-            out[new] = out[old]
-    if "resource_id" not in out.columns:
-        out["resource_id"] = ""
-    if "week_start" not in out.columns:
-        out["week_start"] = pd.NaT
-    if "available_capacity_pct" not in out.columns:
-        working = pd.to_numeric(out.get("working_capacity_pct", 100), errors="coerce")
-        confirmed = pd.to_numeric(out.get("confirmed_allocation_pct", 0), errors="coerce")
-        leave = pd.to_numeric(out.get("leave_pct", 0), errors="coerce")
-        out["available_capacity_pct"] = (working - confirmed - leave).clip(0, 100)
-    out["available_capacity_pct"] = pd.to_numeric(out["available_capacity_pct"], errors="coerce")
-    out["resource_id"] = out["resource_id"].fillna("").astype(str).str.strip()
-    out["week_start"] = pd.to_datetime(out["week_start"], errors="coerce").dt.normalize()
-    return out[["resource_id", "week_start", "available_capacity_pct"]]
 
-
-def load_demo_data(data_dir: Path):
-    resources = canonicalize_resources(pd.read_csv(data_dir / "resources.csv"))
-    capacity = canonicalize_capacity(pd.read_csv(data_dir / "capacity.csv"))
-    return resources, capacity
-
-
-def dataset_health(resources, capacity) -> dict:
+def dataset_health(resources) -> dict:
     rr = validate_resources(resources)
-    cr = validate_capacity(capacity, resources)
     return {
-        "resources_ok": rr.ok, "resources_errors": rr.errors, "resources_warnings": rr.warnings,
-        "capacity_ok": cr.ok, "capacity_errors": cr.errors, "capacity_warnings": cr.warnings,
-        "resource_count": len(resources), "capacity_rows": len(capacity),
+        "resources_ok": rr.ok,
+        "resources_errors": rr.errors,
+        "resources_warnings": rr.warnings,
+        "resource_count": len(resources),
     }

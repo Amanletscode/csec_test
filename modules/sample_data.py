@@ -154,7 +154,7 @@ def _email(name: str) -> str:
     return f"{slug}@csec-demo.example"
 
 
-def generate_demo_data(n_resources: int = 320, start: date = date(2026, 8, 31), weeks: int = 30):
+def generate_demo_data(n_resources: int = 320):
     RNG.seed(20260915)
     anchors = [
         {
@@ -257,30 +257,12 @@ def generate_demo_data(n_resources: int = 320, start: date = date(2026, 8, 31), 
             "expertise_summary": f"{r['grade']} in {r['team']} with {r['years']:.1f} years' experience across {', '.join(sorted(r['domains'])[:3])}.",
         })
     resources_df = pd.DataFrame(resources)
+    return resources_df
 
-    capacity_rows = []
-    for _, r in resources_df.iterrows():
-        # Direct weekly availability stays realistic and demo-friendly.
-        # Every value is guaranteed to remain within 30–70%.
-        # Keep most profiles demo-available while retaining a realistic lower-
-        # availability cohort for exclusion and scenario demonstrations.
-        base = RNG.randint(35, 49) if RNG.random() < 0.20 else RNG.randint(52, 66)
-        for w in range(weeks):
-            wk = start + timedelta(weeks=w)
-            if r.resource_id in {"EMP-1001", "EMP-1002"}:
-                available = 60 + (w % 3) * 3
-            else:
-                available = max(30, min(70, base + RNG.randint(-5, 5)))
-            capacity_rows.append({
-                "resource_id": r.resource_id, "week_start": wk,
-                "available_capacity_pct": available,
-            })
-    return resources_df, pd.DataFrame(capacity_rows)
 
 
 def write_demo_data(data_dir: Path):
     data_dir.mkdir(parents=True, exist_ok=True)
-    resources, capacity = generate_demo_data()
+    resources = generate_demo_data()
     resources.to_csv(data_dir / "resources.csv", index=False)
-    capacity.to_csv(data_dir / "capacity.csv", index=False)
-    return resources, capacity
+    return resources
