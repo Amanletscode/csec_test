@@ -222,7 +222,7 @@ def apply_theme() -> None:
         .match-table .stButton {margin:0 !important;}
         .shortlist-empty {padding:.85rem 1rem; border:1px dashed var(--line); border-radius:12px; background:#FAFCFD; color:var(--muted);}
         .fit-overall {display:flex; justify-content:space-between; align-items:flex-end; margin-top:.9rem; padding-top:.75rem; border-top:1px solid #E8EEF2;}
-        .fit-overall-label {font-size:1rem; font-weight:700; color:var(--muted);}
+        .fit-overall-label {font-size:1.3rem; font-weight:700; color:var(--muted);}
         .fit-overall-value {font-size:1.5rem; line-height:1; font-weight:850; color:var(--ink); letter-spacing:-.025em;}
         .alignment-row {grid-template-columns:1.15fr .8fr 1fr 1fr .75fr;}
         .alignment-row.header {grid-template-columns:1.15fr .8fr 1fr 1fr .75fr;}
@@ -1839,8 +1839,8 @@ def render_recommendations(
     metrics = st.columns(4)
     metrics[0].metric("Roles requested", diagnostics.get("requested_slots", 0))
     metrics[1].metric("Roles fillable", diagnostics.get("fillable_slots", 0))
-    metrics[2].metric("People assessed", diagnostics.get("resources_assessed", 0))
-    metrics[3].metric("Project weeks checked", diagnostics.get("request_window_weeks", 0))
+    metrics[2].metric("Resources evaluated", diagnostics.get("resources_assessed", 0))
+    metrics[3].metric("Planning Horizon", diagnostics.get("request_window_weeks", 0))
 
     st.caption(
         "Every candidate shown here has passed the mandatory designation, capability, "
